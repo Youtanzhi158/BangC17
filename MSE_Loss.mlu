@@ -21,7 +21,6 @@ __mlu_entry__ void mse_loss_half_kernel(const half *predictions,
   __nram__ half nram_target_h[CHUNK_SIZE];
   __nram__ float nram_pred[CHUNK_SIZE];
   __nram__ float nram_target[CHUNK_SIZE];
-  __nram__ float nram_reduce[CHUNK_SIZE];
 
   float local_sum = 0.0f;
   for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
@@ -35,10 +34,10 @@ __mlu_entry__ void mse_loss_half_kernel(const half *predictions,
 
     __bang_half2float(nram_pred, nram_pred_h, aligned_len);
     __bang_half2float(nram_target, nram_target_h, aligned_len);
-    __bang_sub(nram_reduce, nram_pred, nram_target, aligned_len);
-    __bang_square(nram_reduce, nram_reduce, aligned_len);
-    __bang_sum(nram_reduce, nram_reduce, aligned_len);
-    local_sum += nram_reduce[0];
+    for (uint32_t i = 0; i < len; ++i) {
+      float diff = nram_pred[i] - nram_target[i];
+      local_sum += diff * diff;
+    }
   }
   partials[core_id] = local_sum;
 }
@@ -56,7 +55,6 @@ __mlu_entry__ void mse_loss_float_kernel(const float *predictions,
 
   __nram__ float nram_pred[CHUNK_SIZE];
   __nram__ float nram_target[CHUNK_SIZE];
-  __nram__ float nram_reduce[CHUNK_SIZE];
 
   float local_sum = 0.0f;
   for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
@@ -68,10 +66,10 @@ __mlu_entry__ void mse_loss_float_kernel(const float *predictions,
     __memcpy(nram_pred, predictions + start + offset, len * sizeof(float), GDRAM2NRAM);
     __memcpy(nram_target, targets + start + offset, len * sizeof(float), GDRAM2NRAM);
 
-    __bang_sub(nram_reduce, nram_pred, nram_target, aligned_len);
-    __bang_square(nram_reduce, nram_reduce, aligned_len);
-    __bang_sum(nram_reduce, nram_reduce, aligned_len);
-    local_sum += nram_reduce[0];
+    for (uint32_t i = 0; i < len; ++i) {
+      float diff = nram_pred[i] - nram_target[i];
+      local_sum += diff * diff;
+    }
   }
   partials[core_id] = local_sum;
 }
@@ -81,8 +79,11 @@ __mlu_entry__ void finalize_mean_kernel(const float *partials, float *output,
   __nram__ float nram_partials[TASK_NUM];
   __bang_write_value(nram_partials, TASK_NUM, 0.0f);
   __memcpy(nram_partials, partials, TASK_NUM * sizeof(float), GDRAM2NRAM);
-  __bang_sum(nram_partials, nram_partials, TASK_NUM);
-  output[0] = nram_partials[0] / (float)total;
+  float sum = 0.0f;
+  for (int i = 0; i < TASK_NUM; ++i) {
+    sum += nram_partials[i];
+  }
+  output[0] = sum / (float)total;
 }
 
 torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
