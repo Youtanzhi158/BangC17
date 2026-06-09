@@ -3,84 +3,47 @@
 #include <cnrt.h>
 #include <c10/util/Half.h>
 
-#define M_TILE 16
-#define N_TILE 128
-#define K_TILE 128
-#define TASK_NUM 64
+#define TASK_NUM 256
+#define K_CHUNK 1024
 
 __mlu_entry__ void bmm_half_kernel(const half *A, const half *B, float *C,
-                                   int batch, int m, int k, int n) {
-  __nram__ half nram_a_h[M_TILE * K_TILE];
-  __nram__ half nram_b_h[K_TILE * N_TILE];
-  __nram__ float nram_a[M_TILE * K_TILE];
-  __nram__ float nram_b[K_TILE * N_TILE];
-  __nram__ float nram_c[M_TILE * N_TILE];
-  __nram__ float nram_tmp[M_TILE * N_TILE];
-  __wram__ float wram_b[N_TILE * K_TILE];
+                                   int total, int batch, int m, int k, int n) {
+  __nram__ half nram_a_h[K_CHUNK];
+  __nram__ half nram_b_h[K_CHUNK];
+  __nram__ float nram_a[K_CHUNK];
+  __nram__ float nram_b[K_CHUNK];
+  __nram__ float nram_prod[K_CHUNK];
 
-  int m_tiles = (m + M_TILE - 1) / M_TILE;
-  int n_tiles = (n + N_TILE - 1) / N_TILE;
-  int k_tiles = (k + K_TILE - 1) / K_TILE;
-  int total_tiles = batch * m_tiles * n_tiles;
+  for (int idx = taskId; idx < total; idx += taskDim) {
+    int col = idx % n;
+    int tmp = idx / n;
+    int row = tmp % m;
+    int b = tmp / m;
 
-  for (int tile = taskId; tile < total_tiles; tile += taskDim) {
-    int nt = tile % n_tiles;
-    int tmp = tile / n_tiles;
-    int mt = tmp % m_tiles;
-    int b = tmp / m_tiles;
+    float sum = 0.0f;
+    int a_base = (b * m + row) * k;
+    int b_base = b * k * n + col;
 
-    int m_start = mt * M_TILE;
-    int n_start = nt * N_TILE;
-    int m_len = m - m_start;
-    int n_len = n - n_start;
-    if (m_len > M_TILE) m_len = M_TILE;
-    if (n_len > N_TILE) n_len = N_TILE;
+    for (int ks = 0; ks < k; ks += K_CHUNK) {
+      int len = k - ks;
+      if (len > K_CHUNK) len = K_CHUNK;
+      int aligned_len = (len + 63) & ~63;
 
-    __bang_write_value(nram_c, M_TILE * N_TILE, 0.0f);
-
-    for (int kt = 0; kt < k_tiles; ++kt) {
-      int k_start = kt * K_TILE;
-      int k_len = k - k_start;
-      if (k_len > K_TILE) k_len = K_TILE;
-
-      __bang_write_value(nram_a_h, M_TILE * K_TILE, (half)0);
-      __bang_write_value(nram_b_h, K_TILE * N_TILE, (half)0);
-
-      for (int row = 0; row < m_len; ++row) {
-        __memcpy(nram_a_h + row * K_TILE,
-                 A + ((b * m + m_start + row) * k + k_start),
-                 k_len * sizeof(half), GDRAM2NRAM);
-      }
-      for (int row = 0; row < k_len; ++row) {
-        __memcpy(nram_b_h + row * N_TILE,
-                 B + (b * k * n + (k_start + row) * n + n_start),
-                 n_len * sizeof(half), GDRAM2NRAM);
+      __bang_write_value(nram_a_h, aligned_len, (half)0);
+      __bang_write_value(nram_b_h, aligned_len, (half)0);
+      __memcpy(nram_a_h, A + a_base + ks, len * sizeof(half), GDRAM2NRAM);
+      for (int i = 0; i < len; ++i) {
+        nram_b_h[i] = B[b_base + (ks + i) * n];
       }
 
-      __bang_half2float(nram_a, nram_a_h, M_TILE * K_TILE);
-      __bang_half2float(nram_b, nram_b_h, K_TILE * N_TILE);
-
-      int widx = 0;
-      for (int base = 0; base < N_TILE; base += 64) {
-        for (int inner = 0; inner < 64; inner += 4) {
-          for (int lane = 0; lane < 4; ++lane) {
-            int col = base + inner + lane;
-            for (int row = 0; row < K_TILE; ++row) {
-              wram_b[widx++] = nram_b[row * N_TILE + col];
-            }
-          }
-        }
+      __bang_half2float(nram_a, nram_a_h, aligned_len);
+      __bang_half2float(nram_b, nram_b_h, aligned_len);
+      __bang_mul(nram_prod, nram_a, nram_b, aligned_len);
+      for (int i = 0; i < len; ++i) {
+        sum += nram_prod[i];
       }
-
-      __bang_conv(nram_tmp, nram_a, wram_b,
-                  K_TILE, M_TILE, 1, 1, 1, 1, 1, N_TILE);
-      __bang_add(nram_c, nram_c, nram_tmp, M_TILE * N_TILE);
     }
-
-    for (int row = 0; row < m_len; ++row) {
-      __memcpy(C + ((b * m + m_start + row) * n + n_start),
-               nram_c + row * N_TILE, n_len * sizeof(float), NRAM2GDRAM);
-    }
+    C[idx] = sum;
   }
 }
 
@@ -88,16 +51,18 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
   TORCH_CHECK(A.is_contiguous() && B.is_contiguous(), "Inputs must be contiguous");
   TORCH_CHECK(A.scalar_type() == torch::kHalf && B.scalar_type() == torch::kHalf,
               "Only float16 inputs are supported");
+  TORCH_CHECK(A.dim() == 3 && B.dim() == 3, "Inputs must be 3D tensors");
   int batch = static_cast<int>(A.size(0));
   int m = static_cast<int>(A.size(1));
   int k = static_cast<int>(A.size(2));
   int n = static_cast<int>(B.size(2));
   auto output = torch::empty({batch, m, n}, A.options().dtype(torch::kFloat));
+  int total = batch * m * n;
   cnrtQueue_t queue = torch_mlu::getCurMLUStream();
   cnrtDim3_t grid = {TASK_NUM, 1, 1};
   bmm_half_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
       reinterpret_cast<const half *>(A.data_ptr<c10::Half>()),
       reinterpret_cast<const half *>(B.data_ptr<c10::Half>()),
-      output.data_ptr<float>(), batch, m, k, n);
+      output.data_ptr<float>(), total, batch, m, k, n);
   return output;
 }
