@@ -40,8 +40,9 @@ __mlu_entry__ void kl_loss_half_kernel(const half *input_log_prob,
     __bang_mul_scalar(nram_reduce, nram_reduce, LN2, aligned_len);
     __bang_sub(nram_reduce, nram_reduce, nram_input, aligned_len);
     __bang_mul(nram_reduce, nram_reduce, nram_target, aligned_len);
-    __bang_sum(nram_reduce, nram_reduce, aligned_len);
-    local_sum += nram_reduce[0];
+    for (uint32_t i = 0; i < len; ++i) {
+      local_sum += nram_reduce[i];
+    }
   }
   partials[core_id] = local_sum;
 }
@@ -75,8 +76,9 @@ __mlu_entry__ void kl_loss_float_kernel(const float *input_log_prob,
     __bang_mul_scalar(nram_reduce, nram_reduce, LN2, aligned_len);
     __bang_sub(nram_reduce, nram_reduce, nram_input, aligned_len);
     __bang_mul(nram_reduce, nram_reduce, nram_target, aligned_len);
-    __bang_sum(nram_reduce, nram_reduce, aligned_len);
-    local_sum += nram_reduce[0];
+    for (uint32_t i = 0; i < len; ++i) {
+      local_sum += nram_reduce[i];
+    }
   }
   partials[core_id] = local_sum;
 }
@@ -86,8 +88,11 @@ __mlu_entry__ void finalize_batchmean_kernel(const float *partials, float *outpu
   __nram__ float nram_partials[TASK_NUM];
   __bang_write_value(nram_partials, TASK_NUM, 0.0f);
   __memcpy(nram_partials, partials, TASK_NUM * sizeof(float), GDRAM2NRAM);
-  __bang_sum(nram_partials, nram_partials, TASK_NUM);
-  output[0] = nram_partials[0] / (float)batch_size;
+  float sum = 0.0f;
+  for (int i = 0; i < TASK_NUM; ++i) {
+    sum += nram_partials[i];
+  }
+  output[0] = sum / (float)batch_size;
 }
 
 torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob) {
