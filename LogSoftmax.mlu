@@ -15,21 +15,28 @@ __mlu_entry__ void logsoftmax_half_kernel(const half *x, half *out, int rows,
   __nram__ half nram_h[COLS];
   __nram__ float nram_x[COLS];
   __nram__ float nram_tmp[COLS];
-  __nram__ float nram_reduce[64];
+  __nram__ float nram_scalar[64];
 
   const int aligned_cols = (cols + 63) & ~63;
   __memcpy(nram_h, x + row * cols, cols * sizeof(half), GDRAM2NRAM);
   __bang_half2float(nram_x, nram_h, aligned_cols);
 
-  __bang_argmax(nram_reduce, nram_x, aligned_cols);
-  float max_val = nram_reduce[0];
+  float max_val = nram_x[0];
+  for (int i = 1; i < cols; ++i) {
+    if (nram_x[i] > max_val) {
+      max_val = nram_x[i];
+    }
+  }
 
   __bang_sub_scalar(nram_tmp, nram_x, max_val, aligned_cols);
   __bang_active_exphp(nram_tmp, nram_tmp, aligned_cols);
-  __bang_sum(nram_reduce, nram_tmp, aligned_cols);
-  __bang_write_value(nram_reduce, 64, nram_reduce[0]);
-  __bang_log2(nram_reduce, nram_reduce, 64);
-  float log_sum = nram_reduce[0] * LN2;
+  float sum_exp = 0.0f;
+  for (int i = 0; i < cols; ++i) {
+    sum_exp += nram_tmp[i];
+  }
+  __bang_write_value(nram_scalar, 64, sum_exp);
+  __bang_log2(nram_scalar, nram_scalar, 64);
+  float log_sum = nram_scalar[0] * LN2;
 
   __bang_sub_scalar(nram_x, nram_x, max_val + log_sum, aligned_cols);
   __bang_float2half_rd(nram_h, nram_x, aligned_cols);
