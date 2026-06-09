@@ -3,40 +3,58 @@
 #include <cnrt.h>
 #include <c10/util/Half.h>
 
-#define TASK_NUM 64
+#define TASK_NUM 256
+#define TILE_W 256
 
 __mlu_entry__ void dilated_conv2d_half_kernel(const half *x, const half *kernel,
-                                              float *out, int total, int batch,
+                                              float *out, int total_tiles,
                                               int in_channels,
                                               int out_channels, int height,
                                               int width, int kernel_size,
                                               int dilation, int padding,
                                               int out_h, int out_w) {
-  for (int idx = taskId; idx < total; idx += taskDim) {
-    int ow = idx % out_w;
-    int tmp = idx / out_w;
+  __nram__ half nram_x_h[TILE_W];
+  __nram__ float nram_x[TILE_W];
+  __nram__ float nram_out[TILE_W];
+
+  int tiles_w = (out_w + TILE_W - 1) / TILE_W;
+  for (int tile = taskId; tile < total_tiles; tile += taskDim) {
+    int tw = tile % tiles_w;
+    int tmp = tile / tiles_w;
     int oh = tmp % out_h;
     tmp /= out_h;
     int oc = tmp % out_channels;
     int b = tmp / out_channels;
+    int ow_start = tw * TILE_W;
+    int len = out_w - ow_start;
+    if (len > TILE_W) len = TILE_W;
+    int aligned_len = (len + 63) & ~63;
 
-    float sum = 0.0f;
+    __bang_write_value(nram_out, aligned_len, 0.0f);
     for (int ic = 0; ic < in_channels; ++ic) {
       for (int kh = 0; kh < kernel_size; ++kh) {
         int ih = oh - padding + kh * dilation;
         if (ih < 0 || ih >= height) continue;
         for (int kw = 0; kw < kernel_size; ++kw) {
-          int iw = ow - padding + kw * dilation;
-          if (iw < 0 || iw >= width) continue;
-          float xv = (float)x[((b * in_channels + ic) * height + ih) * width + iw];
           float kv = (float)kernel[((oc * in_channels + ic) * kernel_size + kh) *
                                        kernel_size +
                                    kw];
-          sum += xv * kv;
+          for (int i = 0; i < aligned_len; ++i) {
+            int ow = ow_start + i;
+            int iw = ow - padding + kw * dilation;
+            nram_x_h[i] =
+                (i < len && iw >= 0 && iw < width)
+                    ? x[((b * in_channels + ic) * height + ih) * width + iw]
+                    : (half)0;
+          }
+          __bang_half2float(nram_x, nram_x_h, aligned_len);
+          __bang_mul_scalar(nram_x, nram_x, kv, aligned_len);
+          __bang_add(nram_out, nram_out, nram_x, aligned_len);
         }
       }
     }
-    out[idx] = sum;
+    __memcpy(out + ((b * out_channels + oc) * out_h + oh) * out_w + ow_start,
+             nram_out, len * sizeof(float), NRAM2GDRAM);
   }
 }
 
@@ -53,13 +71,14 @@ torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel, int in_channels,
   int out_w = width + 2 * padding - dilation * (kernel_size - 1);
   auto output = torch::empty({batch, out_channels, out_h, out_w},
                              x.options().dtype(torch::kFloat));
-  int total = batch * out_channels * out_h * out_w;
+  int tiles_w = (out_w + TILE_W - 1) / TILE_W;
+  int total_tiles = batch * out_channels * out_h * tiles_w;
   cnrtQueue_t queue = torch_mlu::getCurMLUStream();
   cnrtDim3_t grid = {TASK_NUM, 1, 1};
   dilated_conv2d_half_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
       reinterpret_cast<const half *>(x.data_ptr<c10::Half>()),
       reinterpret_cast<const half *>(kernel.data_ptr<c10::Half>()),
-      output.data_ptr<float>(), total, batch, in_channels, out_channels, height,
+      output.data_ptr<float>(), total_tiles, in_channels, out_channels, height,
       width, kernel_size, dilation, padding, out_h, out_w);
   return output;
 }
