@@ -5,14 +5,14 @@
 
 #define TASK_NUM 128
 
-__mlu_entry__ void cumsum_dim1_half_kernel(const half *x, half *out,
+__mlu_entry__ void cumsum_dim1_half_kernel(const half *x, float *out,
                                            int rows, int cols) {
   for (int row = taskId; row < rows; row += taskDim) {
     float sum = 0.0f;
     for (int col = 0; col < cols; ++col) {
       int idx = row * cols + col;
       sum += (float)x[idx];
-      out[idx] = (half)sum;
+      out[idx] = sum;
     }
   }
 }
@@ -23,11 +23,11 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
   TORCH_CHECK(dim == 1 || dim == -1, "Only dim=1/-1 is supported");
   int rows = static_cast<int>(x.size(0));
   int cols = static_cast<int>(x.size(1));
-  auto output = torch::empty_like(x);
+  auto output = torch::empty({rows, cols}, x.options().dtype(torch::kFloat));
   cnrtQueue_t queue = torch_mlu::getCurMLUStream();
   cnrtDim3_t grid = {TASK_NUM, 1, 1};
   cumsum_dim1_half_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
       reinterpret_cast<const half *>(x.data_ptr<c10::Half>()),
-      reinterpret_cast<half *>(output.data_ptr<c10::Half>()), rows, cols);
+      output.data_ptr<float>(), rows, cols);
   return output;
 }
