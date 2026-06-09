@@ -6,7 +6,7 @@
 #define TASK_NUM 64
 
 __mlu_entry__ void conv_transpose2d_half_kernel(
-    const half *x, const half *kernel, half *out, int total, int batch,
+    const half *x, const half *kernel, float *out, int total, int batch,
     int in_channels, int out_channels, int h_in, int w_in, int kernel_size,
     int stride, int padding, int output_padding, int groups, int h_out,
     int w_out) {
@@ -45,7 +45,7 @@ __mlu_entry__ void conv_transpose2d_half_kernel(
         }
       }
     }
-    out[idx] = (half)sum;
+    out[idx] = sum;
   }
 }
 
@@ -61,14 +61,15 @@ torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel, int in_channels,
   int w_in = static_cast<int>(x.size(3));
   int h_out = (h_in - 1) * stride - 2 * padding + kernel_size + output_padding;
   int w_out = (w_in - 1) * stride - 2 * padding + kernel_size + output_padding;
-  auto output = torch::empty({batch, out_channels, h_out, w_out}, x.options());
+  auto output = torch::empty({batch, out_channels, h_out, w_out},
+                             x.options().dtype(torch::kFloat));
   int total = batch * out_channels * h_out * w_out;
   cnrtQueue_t queue = torch_mlu::getCurMLUStream();
   cnrtDim3_t grid = {TASK_NUM, 1, 1};
   conv_transpose2d_half_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
       reinterpret_cast<const half *>(x.data_ptr<c10::Half>()),
       reinterpret_cast<const half *>(kernel.data_ptr<c10::Half>()),
-      reinterpret_cast<half *>(output.data_ptr<c10::Half>()), total, batch,
+      output.data_ptr<float>(), total, batch,
       in_channels, out_channels, h_in, w_in, kernel_size, stride, padding,
       output_padding, groups, h_out, w_out);
   return output;

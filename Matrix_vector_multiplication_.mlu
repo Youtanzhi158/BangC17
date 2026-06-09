@@ -7,7 +7,7 @@
 #define COLS 131072
 #define CHUNK 4096
 
-__mlu_entry__ void gemv_half_kernel(const half *A, const half *B, half *out,
+__mlu_entry__ void gemv_half_kernel(const half *A, const half *B, float *out,
                                     int rows, int cols) {
   int row = taskId;
   if (row >= rows) return;
@@ -17,7 +17,6 @@ __mlu_entry__ void gemv_half_kernel(const half *A, const half *B, half *out,
   __nram__ float fa[CHUNK];
   __nram__ float fb[CHUNK];
   __nram__ float prod[CHUNK];
-  __nram__ float red[64];
 
   float sum = 0.0f;
   for (int off = 0; off < cols; off += CHUNK) {
@@ -30,10 +29,11 @@ __mlu_entry__ void gemv_half_kernel(const half *A, const half *B, half *out,
     __bang_half2float(fa, nram_a, aligned);
     __bang_half2float(fb, nram_b, aligned);
     __bang_mul(prod, fa, fb, aligned);
-    __bang_sum(red, prod, aligned);
-    sum += red[0];
+    for (int i = 0; i < len; ++i) {
+      sum += prod[i];
+    }
   }
-  out[row] = (half)sum;
+  out[row] = sum;
 }
 
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
@@ -42,12 +42,12 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
               "Only float16 inputs are supported");
   int rows = static_cast<int>(A.size(0));
   int cols = static_cast<int>(A.size(1));
-  auto output = torch::empty({rows, 1}, A.options());
+  auto output = torch::empty({rows, 1}, A.options().dtype(torch::kFloat));
   cnrtQueue_t queue = torch_mlu::getCurMLUStream();
   cnrtDim3_t grid = {static_cast<unsigned int>(rows), 1, 1};
   gemv_half_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
       reinterpret_cast<const half *>(A.data_ptr<c10::Half>()),
       reinterpret_cast<const half *>(B.data_ptr<c10::Half>()),
-      reinterpret_cast<half *>(output.data_ptr<c10::Half>()), rows, cols);
+      output.data_ptr<float>(), rows, cols);
   return output;
 }
