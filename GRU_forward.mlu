@@ -1,0 +1,166 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <c10/util/Half.h>
+
+#define TASK_NUM 256
+
+__mlu_entry__ void init_state_kernel(float *a, float *b, int total) {
+  for (int i = taskId; i < total; i += taskDim) {
+    a[i] = 0.0f;
+    b[i] = 0.0f;
+  }
+}
+
+__mlu_func__ float sigmoid_scalar(float x, float *tmp) {
+  __bang_write_value(tmp, 64, -x);
+  __bang_active_exphp(tmp, tmp, 64);
+  return 1.0f / (1.0f + tmp[0]);
+}
+
+__mlu_func__ float tanh_scalar(float x, float *tmp) {
+  __bang_write_value(tmp, 64, -2.0f * x);
+  __bang_active_exphp(tmp, tmp, 64);
+  return 2.0f / (1.0f + tmp[0]) - 1.0f;
+}
+
+__mlu_entry__ void gru_layer0_step_kernel(
+    const half *x, const half *weight_ih, const half *weight_hh,
+    const half *bias_ih, const half *bias_hh, const float *h_prev,
+    float *h_next, float *layer_out, int t, int batch, int seq_len,
+    int input_size, int hidden_size) {
+  __nram__ float tmp_act[64];
+  for (int h = taskId; h < hidden_size; h += taskDim) {
+    for (int b = 0; b < batch; ++b) {
+      float ir = (float)bias_ih[h];
+      float iz = (float)bias_ih[hidden_size + h];
+      float in = (float)bias_ih[2 * hidden_size + h];
+      float hr = (float)bias_hh[h];
+      float hz = (float)bias_hh[hidden_size + h];
+      float hn = (float)bias_hh[2 * hidden_size + h];
+
+      int x_base = (b * seq_len + t) * input_size;
+      for (int k = 0; k < input_size; ++k) {
+        float xv = (float)x[x_base + k];
+        ir += xv * (float)weight_ih[h * input_size + k];
+        iz += xv * (float)weight_ih[(hidden_size + h) * input_size + k];
+        in += xv * (float)weight_ih[(2 * hidden_size + h) * input_size + k];
+      }
+
+      int h_base = b * hidden_size;
+      for (int k = 0; k < hidden_size; ++k) {
+        float hv = h_prev[h_base + k];
+        hr += hv * (float)weight_hh[h * hidden_size + k];
+        hz += hv * (float)weight_hh[(hidden_size + h) * hidden_size + k];
+        hn += hv * (float)weight_hh[(2 * hidden_size + h) * hidden_size + k];
+      }
+
+      float r = sigmoid_scalar(ir + hr, tmp_act);
+      float z = sigmoid_scalar(iz + hz, tmp_act);
+      float n_val = tanh_scalar(in + r * hn, tmp_act);
+      float prev = h_prev[h_base + h];
+      float ht = (1.0f - z) * n_val + z * prev;
+      h_next[h_base + h] = ht;
+      layer_out[h_base + h] = ht;
+    }
+  }
+}
+
+__mlu_entry__ void gru_layer1_step_kernel(
+    const float *layer_in, const half *weight_ih, const half *weight_hh,
+    const half *bias_ih, const half *bias_hh, const float *h_prev,
+    float *h_next, float *output, int t, int batch, int seq_len,
+    int hidden_size) {
+  __nram__ float tmp_act[64];
+  for (int h = taskId; h < hidden_size; h += taskDim) {
+    for (int b = 0; b < batch; ++b) {
+      float ir = (float)bias_ih[h];
+      float iz = (float)bias_ih[hidden_size + h];
+      float in = (float)bias_ih[2 * hidden_size + h];
+      float hr = (float)bias_hh[h];
+      float hz = (float)bias_hh[hidden_size + h];
+      float hn = (float)bias_hh[2 * hidden_size + h];
+
+      int h_base = b * hidden_size;
+      for (int k = 0; k < hidden_size; ++k) {
+        float xv = layer_in[h_base + k];
+        ir += xv * (float)weight_ih[h * hidden_size + k];
+        iz += xv * (float)weight_ih[(hidden_size + h) * hidden_size + k];
+        in += xv * (float)weight_ih[(2 * hidden_size + h) * hidden_size + k];
+
+        float hv = h_prev[h_base + k];
+        hr += hv * (float)weight_hh[h * hidden_size + k];
+        hz += hv * (float)weight_hh[(hidden_size + h) * hidden_size + k];
+        hn += hv * (float)weight_hh[(2 * hidden_size + h) * hidden_size + k];
+      }
+
+      float r = sigmoid_scalar(ir + hr, tmp_act);
+      float z = sigmoid_scalar(iz + hz, tmp_act);
+      float n_val = tanh_scalar(in + r * hn, tmp_act);
+      float prev = h_prev[h_base + h];
+      float ht = (1.0f - z) * n_val + z * prev;
+      h_next[h_base + h] = ht;
+      output[(b * seq_len + t) * hidden_size + h] = ht;
+    }
+  }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor x, torch::Tensor weight_ih_l0, torch::Tensor weight_hh_l0,
+    torch::Tensor bias_ih_l0, torch::Tensor bias_hh_l0,
+    torch::Tensor weight_ih_l1, torch::Tensor weight_hh_l1,
+    torch::Tensor bias_ih_l1, torch::Tensor bias_hh_l1, int input_size,
+    int hidden_size, int num_layers) {
+  TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+  TORCH_CHECK(weight_ih_l0.is_contiguous() && weight_hh_l0.is_contiguous() &&
+                  bias_ih_l0.is_contiguous() && bias_hh_l0.is_contiguous() &&
+                  weight_ih_l1.is_contiguous() && weight_hh_l1.is_contiguous() &&
+                  bias_ih_l1.is_contiguous() && bias_hh_l1.is_contiguous(),
+              "GRU weights must be contiguous");
+  TORCH_CHECK(x.scalar_type() == torch::kHalf, "Only float16 input is supported");
+  TORCH_CHECK(num_layers == 2, "Only the 2-layer GRU case is supported");
+
+  int batch = static_cast<int>(x.size(0));
+  int seq_len = static_cast<int>(x.size(1));
+  auto options = x.options().dtype(torch::kFloat);
+  auto output = torch::empty({batch, seq_len, hidden_size}, options);
+  auto h0_a = torch::empty({batch, hidden_size}, options);
+  auto h0_b = torch::empty({batch, hidden_size}, options);
+  auto h1_a = torch::empty({batch, hidden_size}, options);
+  auto h1_b = torch::empty({batch, hidden_size}, options);
+  auto layer0_out = torch::empty({batch, hidden_size}, options);
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t grid = {TASK_NUM, 1, 1};
+  init_state_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
+      h0_a.data_ptr<float>(), h1_a.data_ptr<float>(), batch * hidden_size);
+
+  for (int t = 0; t < seq_len; ++t) {
+    gru_layer0_step_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
+        reinterpret_cast<const half *>(x.data_ptr<c10::Half>()),
+        reinterpret_cast<const half *>(weight_ih_l0.data_ptr<c10::Half>()),
+        reinterpret_cast<const half *>(weight_hh_l0.data_ptr<c10::Half>()),
+        reinterpret_cast<const half *>(bias_ih_l0.data_ptr<c10::Half>()),
+        reinterpret_cast<const half *>(bias_hh_l0.data_ptr<c10::Half>()),
+        h0_a.data_ptr<float>(), h0_b.data_ptr<float>(),
+        layer0_out.data_ptr<float>(), t, batch, seq_len, input_size,
+        hidden_size);
+
+    gru_layer1_step_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
+        layer0_out.data_ptr<float>(),
+        reinterpret_cast<const half *>(weight_ih_l1.data_ptr<c10::Half>()),
+        reinterpret_cast<const half *>(weight_hh_l1.data_ptr<c10::Half>()),
+        reinterpret_cast<const half *>(bias_ih_l1.data_ptr<c10::Half>()),
+        reinterpret_cast<const half *>(bias_hh_l1.data_ptr<c10::Half>()),
+        h1_a.data_ptr<float>(), h1_b.data_ptr<float>(), output.data_ptr<float>(),
+        t, batch, seq_len, hidden_size);
+
+    auto tmp0 = h0_a;
+    h0_a = h0_b;
+    h0_b = tmp0;
+    auto tmp1 = h1_a;
+    h1_a = h1_b;
+    h1_b = tmp1;
+  }
+  return output;
+}
