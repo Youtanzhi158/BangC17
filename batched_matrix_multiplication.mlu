@@ -34,11 +34,15 @@ __mlu_entry__ void bmm_half_kernel(const half *A, const half *B, float *C,
       const half *a_ptr = A + ((b * m + m_start) * k + k_start);
       const half *b_ptr = B + (b * k * n + k_start * n + n_start);
 
-      __memcpy_async(nram_a, a_ptr, K_TILE * sizeof(half), GDRAM2NRAM,
-                     K_TILE * sizeof(half), k * sizeof(half), M_TILE - 1);
-      __memcpy_async(nram_b, b_ptr, N_TILE * sizeof(half), GDRAM2NRAM,
-                     N_TILE * sizeof(half), n * sizeof(half), K_TILE - 1);
-      __asm__ volatile("sync;");
+      for (int row = 0; row < M_TILE; ++row) {
+        __memcpy(nram_a + row * K_TILE, a_ptr + row * k,
+                 K_TILE * sizeof(half), GDRAM2NRAM);
+      }
+      for (int row = 0; row < K_TILE; ++row) {
+        __memcpy(nram_b + row * N_TILE, b_ptr + row * n,
+                 N_TILE * sizeof(half), GDRAM2NRAM);
+      }
+      __sync();
 
       __bang_transpose(nram_b_t, nram_b, K_TILE, N_TILE);
       __memcpy(wram_b, nram_b_t, N_TILE * K_TILE * sizeof(half), NRAM2WRAM);
