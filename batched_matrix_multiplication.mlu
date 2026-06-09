@@ -60,9 +60,15 @@ __mlu_entry__ void bmm_half_kernel(const half *A, const half *B, float *C,
       __bang_half2float(nram_a, nram_a_h, M_TILE * K_TILE);
       __bang_half2float(nram_b, nram_b_h, K_TILE * N_TILE);
 
-      for (int col = 0; col < N_TILE; ++col) {
-        for (int row = 0; row < K_TILE; ++row) {
-          wram_b[col * K_TILE + row] = nram_b[row * N_TILE + col];
+      int widx = 0;
+      for (int base = 0; base < N_TILE; base += 64) {
+        for (int inner = 0; inner < 64; inner += 4) {
+          for (int lane = 0; lane < 4; ++lane) {
+            int col = base + inner + lane;
+            for (int row = 0; row < K_TILE; ++row) {
+              wram_b[widx++] = nram_b[row * N_TILE + col];
+            }
+          }
         }
       }
 
