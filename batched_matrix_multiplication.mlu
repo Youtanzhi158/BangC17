@@ -6,18 +6,21 @@
 #define M_TILE 16
 #define N_TILE 128
 #define K_TILE 128
+#define TASK_NUM 64
 
 __mlu_entry__ void bmm_half_kernel(const half *A, const half *B, float *C,
                                    int batch, int m, int k, int n) {
-  __nram__ half nram_a[M_TILE * K_TILE];
-  __nram__ half nram_b[K_TILE * N_TILE];
-  __nram__ half nram_b_t[N_TILE * K_TILE];
+  __nram__ half nram_a_h[M_TILE * K_TILE];
+  __nram__ half nram_b_h[K_TILE * N_TILE];
+  __nram__ float nram_a[M_TILE * K_TILE];
+  __nram__ float nram_b[K_TILE * N_TILE];
   __nram__ float nram_c[M_TILE * N_TILE];
   __nram__ float nram_tmp[M_TILE * N_TILE];
-  __wram__ half wram_b[N_TILE * K_TILE];
+  __wram__ float wram_b[N_TILE * K_TILE];
 
-  int m_tiles = m / M_TILE;
-  int n_tiles = n / N_TILE;
+  int m_tiles = (m + M_TILE - 1) / M_TILE;
+  int n_tiles = (n + N_TILE - 1) / N_TILE;
+  int k_tiles = (k + K_TILE - 1) / K_TILE;
   int total_tiles = batch * m_tiles * n_tiles;
 
   for (int tile = taskId; tile < total_tiles; tile += taskDim) {
@@ -28,31 +31,49 @@ __mlu_entry__ void bmm_half_kernel(const half *A, const half *B, float *C,
 
     int m_start = mt * M_TILE;
     int n_start = nt * N_TILE;
+    int m_len = m - m_start;
+    int n_len = n - n_start;
+    if (m_len > M_TILE) m_len = M_TILE;
+    if (n_len > N_TILE) n_len = N_TILE;
+
     __bang_write_value(nram_c, M_TILE * N_TILE, 0.0f);
 
-    for (int k_start = 0; k_start < k; k_start += K_TILE) {
-      const half *a_ptr = A + ((b * m + m_start) * k + k_start);
-      const half *b_ptr = B + (b * k * n + k_start * n + n_start);
+    for (int kt = 0; kt < k_tiles; ++kt) {
+      int k_start = kt * K_TILE;
+      int k_len = k - k_start;
+      if (k_len > K_TILE) k_len = K_TILE;
 
-      for (int row = 0; row < M_TILE; ++row) {
-        __memcpy(nram_a + row * K_TILE, a_ptr + row * k,
-                 K_TILE * sizeof(half), GDRAM2NRAM);
-      }
-      for (int row = 0; row < K_TILE; ++row) {
-        __memcpy(nram_b + row * N_TILE, b_ptr + row * n,
-                 N_TILE * sizeof(half), GDRAM2NRAM);
-      }
-      __sync();
+      __bang_write_value(nram_a_h, M_TILE * K_TILE, (half)0);
+      __bang_write_value(nram_b_h, K_TILE * N_TILE, (half)0);
 
-      __bang_transpose(nram_b_t, nram_b, K_TILE, N_TILE);
-      __memcpy(wram_b, nram_b_t, N_TILE * K_TILE * sizeof(half), NRAM2WRAM);
-      __bang_matmul(nram_tmp, nram_a, wram_b, M_TILE, K_TILE, N_TILE, 0);
+      for (int row = 0; row < m_len; ++row) {
+        __memcpy(nram_a_h + row * K_TILE,
+                 A + ((b * m + m_start + row) * k + k_start),
+                 k_len * sizeof(half), GDRAM2NRAM);
+      }
+      for (int row = 0; row < k_len; ++row) {
+        __memcpy(nram_b_h + row * N_TILE,
+                 B + (b * k * n + (k_start + row) * n + n_start),
+                 n_len * sizeof(half), GDRAM2NRAM);
+      }
+
+      __bang_half2float(nram_a, nram_a_h, M_TILE * K_TILE);
+      __bang_half2float(nram_b, nram_b_h, K_TILE * N_TILE);
+
+      for (int col = 0; col < N_TILE; ++col) {
+        for (int row = 0; row < K_TILE; ++row) {
+          wram_b[col * K_TILE + row] = nram_b[row * N_TILE + col];
+        }
+      }
+
+      __bang_conv(nram_tmp, nram_a, wram_b,
+                  K_TILE, M_TILE, 1, 1, 1, 1, 1, N_TILE);
       __bang_add(nram_c, nram_c, nram_tmp, M_TILE * N_TILE);
     }
 
-    for (int row = 0; row < M_TILE; ++row) {
+    for (int row = 0; row < m_len; ++row) {
       __memcpy(C + ((b * m + m_start + row) * n + n_start),
-               nram_c + row * N_TILE, N_TILE * sizeof(float), NRAM2GDRAM);
+               nram_c + row * N_TILE, n_len * sizeof(float), NRAM2GDRAM);
     }
   }
 }
@@ -67,7 +88,7 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
   int n = static_cast<int>(B.size(2));
   auto output = torch::empty({batch, m, n}, A.options().dtype(torch::kFloat));
   cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-  cnrtDim3_t grid = {64, 1, 1};
+  cnrtDim3_t grid = {TASK_NUM, 1, 1};
   bmm_half_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
       reinterpret_cast<const half *>(A.data_ptr<c10::Half>()),
       reinterpret_cast<const half *>(B.data_ptr<c10::Half>()),
