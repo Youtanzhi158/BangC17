@@ -4,121 +4,56 @@
 #include <c10/util/Half.h>
 
 #define TASK_NUM 256
-#define ROWS_PER_TILE 2
-#define TILE_W 128
-#define MAX_CHANNELS 64
-#define MAX_OUT_CHANNELS 64
-#define MAX_EFF_KERNEL 7
-#define MAX_IN_ROWS (ROWS_PER_TILE + MAX_EFF_KERNEL - 1)
-#define MAX_IN_COLS (TILE_W + MAX_EFF_KERNEL - 1)
+#define TILE_W 256
 
 __mlu_entry__ void dilated_conv2d_half_kernel(
     const half *x, const half *kernel, float *out, int total_tiles,
     int in_channels, int out_channels, int height, int width, int kernel_size,
-    int dilation, int padding, int out_h, int out_w, int eff_kernel) {
-  __nram__ float nram_in[MAX_IN_ROWS * MAX_IN_COLS * MAX_CHANNELS];
-  __nram__ float nram_out[ROWS_PER_TILE * TILE_W * MAX_OUT_CHANNELS];
-  __wram__ float wram_filter[MAX_OUT_CHANNELS * MAX_EFF_KERNEL *
-                             MAX_EFF_KERNEL * MAX_CHANNELS];
+    int dilation, int padding, int out_h, int out_w) {
+  __nram__ half nram_x_h[TILE_W];
+  __nram__ float nram_x[TILE_W];
+  __nram__ float nram_out[TILE_W];
 
-  int col_tiles = (out_w + TILE_W - 1) / TILE_W;
-  int row_tiles = (out_h + ROWS_PER_TILE - 1) / ROWS_PER_TILE;
-
+  int tiles_w = (out_w + TILE_W - 1) / TILE_W;
   for (int tile = taskId; tile < total_tiles; tile += taskDim) {
-    int col_tile = tile % col_tiles;
-    int tmp = tile / col_tiles;
-    int row_tile = tmp % row_tiles;
-    int b = tmp / row_tiles;
+    int tw = tile % tiles_w;
+    int tmp = tile / tiles_w;
+    int oh = tmp % out_h;
+    tmp /= out_h;
+    int oc = tmp % out_channels;
+    int b = tmp / out_channels;
+    int ow_start = tw * TILE_W;
+    int len = out_w - ow_start;
+    if (len > TILE_W) len = TILE_W;
+    int aligned_len = (len + 63) & ~63;
 
-    int oh_start = row_tile * ROWS_PER_TILE;
-    int ow_start = col_tile * TILE_W;
-    int rows = out_h - oh_start;
-    int cols = out_w - ow_start;
-    if (rows > ROWS_PER_TILE) rows = ROWS_PER_TILE;
-    if (cols > TILE_W) cols = TILE_W;
-
-    int in_rows = ROWS_PER_TILE + eff_kernel - 1;
-    int in_cols = TILE_W + eff_kernel - 1;
-
-    for (int ih_local = 0; ih_local < in_rows; ++ih_local) {
-      int ih = oh_start - padding + ih_local;
-      for (int iw_local = 0; iw_local < in_cols; ++iw_local) {
-        int iw = ow_start - padding + iw_local;
-        int valid = (ih >= 0 && ih < height && iw >= 0 && iw < width);
-        int dst_base = (ih_local * in_cols + iw_local) * in_channels;
-        for (int ic = 0; ic < in_channels; ++ic) {
-          nram_in[dst_base + ic] =
-              valid ? (float)x[((b * in_channels + ic) * height + ih) * width +
-                                iw]
-                    : 0.0f;
-        }
-      }
-    }
-
-    int fidx = 0;
-    int align64 = out_channels / 64;
-    if (align64 > 0) {
-      for (int base = 0; base < 64; base += 4) {
-        for (int block = 0; block < align64; ++block) {
-          for (int lane = 0; lane < 4; ++lane) {
-            int oc = base + block * 64 + lane;
-            for (int eh = 0; eh < eff_kernel; ++eh) {
-              for (int ew = 0; ew < eff_kernel; ++ew) {
-                int kh = eh / dilation;
-                int kw = ew / dilation;
-                int active = (eh % dilation == 0 && ew % dilation == 0 &&
-                              kh < kernel_size && kw < kernel_size);
-                for (int ic = 0; ic < in_channels; ++ic) {
-                  wram_filter[fidx++] =
-                      active
-                          ? (float)kernel[((oc * in_channels + ic) *
-                                               kernel_size +
-                                           kh) *
-                                              kernel_size +
-                                          kw]
-                          : 0.0f;
-                }
-              }
-            }
+    __bang_write_value(nram_out, aligned_len, 0.0f);
+    for (int ic = 0; ic < in_channels; ++ic) {
+      for (int kh = 0; kh < kernel_size; ++kh) {
+        int ih = oh - padding + kh * dilation;
+        if (ih < 0 || ih >= height) continue;
+        for (int kw = 0; kw < kernel_size; ++kw) {
+          float kv = (float)kernel[((oc * in_channels + ic) * kernel_size +
+                                    kh) *
+                                       kernel_size +
+                                   kw];
+          for (int i = 0; i < aligned_len; ++i) {
+            int ow = ow_start + i;
+            int iw = ow - padding + kw * dilation;
+            nram_x_h[i] =
+                (i < len && iw >= 0 && iw < width)
+                    ? x[((b * in_channels + ic) * height + ih) * width + iw]
+                    : (half)0;
           }
-        }
-      }
-    } else {
-      for (int oc = 0; oc < out_channels; ++oc) {
-        for (int eh = 0; eh < eff_kernel; ++eh) {
-          for (int ew = 0; ew < eff_kernel; ++ew) {
-            int kh = eh / dilation;
-            int kw = ew / dilation;
-            int active = (eh % dilation == 0 && ew % dilation == 0 &&
-                          kh < kernel_size && kw < kernel_size);
-            for (int ic = 0; ic < in_channels; ++ic) {
-              wram_filter[fidx++] =
-                  active
-                      ? (float)kernel[((oc * in_channels + ic) * kernel_size +
-                                       kh) *
-                                          kernel_size +
-                                      kw]
-                      : 0.0f;
-            }
-          }
+          __bang_half2float(nram_x, nram_x_h, aligned_len);
+          __bang_mul_scalar(nram_x, nram_x, kv, aligned_len);
+          __bang_add(nram_out, nram_out, nram_x, aligned_len);
         }
       }
     }
 
-    __bang_conv(nram_out, nram_in, wram_filter, in_channels, in_rows, in_cols,
-                eff_kernel, eff_kernel, 1, 1, out_channels);
-
-    for (int rh = 0; rh < rows; ++rh) {
-      int oh = oh_start + rh;
-      for (int cw = 0; cw < cols; ++cw) {
-        int ow = ow_start + cw;
-        int src_base = (rh * TILE_W + cw) * out_channels;
-        for (int oc = 0; oc < out_channels; ++oc) {
-          out[((b * out_channels + oc) * out_h + oh) * out_w + ow] =
-              nram_out[src_base + oc];
-        }
-      }
-    }
+    __memcpy(out + ((b * out_channels + oc) * out_h + oh) * out_w + ow_start,
+             nram_out, len * sizeof(float), NRAM2GDRAM);
   }
 }
 
@@ -130,11 +65,6 @@ torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel, int in_channels,
   TORCH_CHECK(x.scalar_type() == torch::kHalf &&
                   kernel.scalar_type() == torch::kHalf,
               "Only float16 inputs are supported");
-  int eff_kernel = (kernel_size - 1) * dilation + 1;
-  TORCH_CHECK(in_channels <= MAX_CHANNELS &&
-                  out_channels <= MAX_OUT_CHANNELS &&
-                  eff_kernel <= MAX_EFF_KERNEL,
-              "Shape exceeds this implementation limit");
 
   int batch = static_cast<int>(x.size(0));
   int height = static_cast<int>(x.size(2));
@@ -144,15 +74,14 @@ torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel, int in_channels,
   auto output = torch::empty({batch, out_channels, out_h, out_w},
                              x.options().dtype(torch::kFloat));
 
-  int row_tiles = (out_h + ROWS_PER_TILE - 1) / ROWS_PER_TILE;
-  int col_tiles = (out_w + TILE_W - 1) / TILE_W;
-  int total_tiles = batch * row_tiles * col_tiles;
+  int tiles_w = (out_w + TILE_W - 1) / TILE_W;
+  int total_tiles = batch * out_channels * out_h * tiles_w;
   cnrtQueue_t queue = torch_mlu::getCurMLUStream();
   cnrtDim3_t grid = {TASK_NUM, 1, 1};
   dilated_conv2d_half_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
       reinterpret_cast<const half *>(x.data_ptr<c10::Half>()),
       reinterpret_cast<const half *>(kernel.data_ptr<c10::Half>()),
       output.data_ptr<float>(), total_tiles, in_channels, out_channels, height,
-      width, kernel_size, dilation, padding, out_h, out_w, eff_kernel);
+      width, kernel_size, dilation, padding, out_h, out_w);
   return output;
 }
