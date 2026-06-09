@@ -1,0 +1,43 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <c10/util/Half.h>
+
+#define TASK_NUM 64
+
+__mlu_entry__ void bmm_half_kernel(const half *A, const half *B, half *C,
+                                   int total, int batch, int m, int k, int n) {
+  for (int idx = taskId; idx < total; idx += taskDim) {
+    int col = idx % n;
+    int tmp = idx / n;
+    int row = tmp % m;
+    int b = tmp / m;
+    float sum = 0.0f;
+    const int a_base = (b * m + row) * k;
+    const int b_base = b * k * n + col;
+    for (int kk = 0; kk < k; ++kk) {
+      sum += (float)A[a_base + kk] * (float)B[b_base + kk * n];
+    }
+    C[idx] = (half)sum;
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
+  TORCH_CHECK(A.is_contiguous() && B.is_contiguous(), "Inputs must be contiguous");
+  TORCH_CHECK(A.scalar_type() == torch::kHalf && B.scalar_type() == torch::kHalf,
+              "Only float16 inputs are supported");
+  int batch = static_cast<int>(A.size(0));
+  int m = static_cast<int>(A.size(1));
+  int k = static_cast<int>(A.size(2));
+  int n = static_cast<int>(B.size(2));
+  auto output = torch::empty({batch, m, n}, A.options());
+  int total = batch * m * n;
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t grid = {TASK_NUM, 1, 1};
+  bmm_half_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
+      reinterpret_cast<const half *>(A.data_ptr<c10::Half>()),
+      reinterpret_cast<const half *>(B.data_ptr<c10::Half>()),
+      reinterpret_cast<half *>(output.data_ptr<c10::Half>()), total, batch, m,
+      k, n);
+  return output;
+}

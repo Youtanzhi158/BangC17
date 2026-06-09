@@ -1,0 +1,54 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <c10/util/Half.h>
+
+#define TASK_NUM 64
+
+__mlu_entry__ void avgpool2d_half_kernel(const half *x, half *out, int total,
+                                         int batch, int channels, int height,
+                                         int width, int kernel_size,
+                                         int out_h, int out_w) {
+  for (int idx = taskId; idx < total; idx += taskDim) {
+    int ow = idx % out_w;
+    int tmp = idx / out_w;
+    int oh = tmp % out_h;
+    tmp /= out_h;
+    int c = tmp % channels;
+    int b = tmp / channels;
+
+    float sum = 0.0f;
+    int base_h = oh * kernel_size;
+    int base_w = ow * kernel_size;
+    for (int kh = 0; kh < kernel_size; ++kh) {
+      for (int kw = 0; kw < kernel_size; ++kw) {
+        int ih = base_h + kh;
+        int iw = base_w + kw;
+        long long in_idx =
+            (((long long)b * channels + c) * height + ih) * (long long)width + iw;
+        sum += (float)x[in_idx];
+      }
+    }
+    out[idx] = (half)(sum / (float)(kernel_size * kernel_size));
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int kernel_size) {
+  TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+  TORCH_CHECK(x.scalar_type() == torch::kHalf, "Only float16 input is supported");
+  int batch = static_cast<int>(x.size(0));
+  int channels = static_cast<int>(x.size(1));
+  int height = static_cast<int>(x.size(2));
+  int width = static_cast<int>(x.size(3));
+  int out_h = (height - kernel_size) / kernel_size + 1;
+  int out_w = (width - kernel_size) / kernel_size + 1;
+  auto output = torch::empty({batch, channels, out_h, out_w}, x.options());
+  int total = batch * channels * out_h * out_w;
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t grid = {TASK_NUM, 1, 1};
+  avgpool2d_half_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
+      reinterpret_cast<const half *>(x.data_ptr<c10::Half>()),
+      reinterpret_cast<half *>(output.data_ptr<c10::Half>()), total, batch,
+      channels, height, width, kernel_size, out_h, out_w);
+  return output;
+}
