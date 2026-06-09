@@ -46,11 +46,10 @@ __mlu_entry__ void dilated_conv2d_half_kernel(
           for (int cw = 0; cw < TILE_W; ++cw) {
             int ow = ow_start + cw;
             int iw = ow - padding + kw * dilation;
-            int base = (rh * TILE_W + cw) * in_channels;
             int valid = (rh < rows && cw < cols && ih >= 0 && ih < height &&
                          iw >= 0 && iw < width);
             for (int ic = 0; ic < in_channels; ++ic) {
-              nram_in[base + ic] =
+              nram_in[ic * ROWS_PER_TILE * TILE_W + rh * TILE_W + cw] =
                   valid ? (float)x[((b * in_channels + ic) * height + ih) *
                                         width +
                                     iw]
@@ -97,10 +96,9 @@ __mlu_entry__ void dilated_conv2d_half_kernel(
       int oh = oh_start + rh;
       for (int cw = 0; cw < cols; ++cw) {
         int ow = ow_start + cw;
-        int src_base = (rh * TILE_W + cw) * out_channels;
         for (int oc = 0; oc < out_channels; ++oc) {
           out[((b * out_channels + oc) * out_h + oh) * out_w + ow] =
-              nram_acc[src_base + oc];
+              nram_acc[oc * ROWS_PER_TILE * TILE_W + rh * TILE_W + cw];
         }
       }
     }
