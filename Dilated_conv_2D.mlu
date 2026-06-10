@@ -127,11 +127,10 @@ __mlu_entry__ void dilated_conv2d_half_kernel(
       int oh = oh_start + rh;
       for (int cw = 0; cw < cols; ++cw) {
         int ow = ow_start + cw;
-        int src_base = (rh * cols + cw) * oc_count;
         for (int oc_local = 0; oc_local < oc_count; ++oc_local) {
           int oc = oc_start + oc_local;
           out[((b * out_channels + oc) * out_h + oh) * out_w + ow] =
-              nram_acc[src_base + oc_local];
+              nram_acc[(oc_local * rows + rh) * cols + cw];
         }
       }
     }
