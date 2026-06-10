@@ -7,7 +7,7 @@
 #define TILE_W 128
 
 __mlu_entry__ void grouped_conv2d_half_kernel(
-    const half *x, const half *kernel, const half *bias, float *out,
+    const half *x, const half *kernel, float *out,
     int total_tiles, int in_channels, int out_channels,
     int height, int width, int kernel_size, int groups,
     int padding, int out_h, int out_w) {
@@ -34,11 +34,7 @@ __mlu_entry__ void grouped_conv2d_half_kernel(
     if (len > TILE_W) len = TILE_W;
     int aligned_len = (len + 63) & ~63;
 
-    // 初始化累加器为 bias 值
-    float bias_val = (float)bias[oc];
-    for (int i = 0; i < aligned_len; ++i) {
-      nram_out[i] = bias_val;
-    }
+    __bang_write_value(nram_out, aligned_len, 0.0f);
 
     for (int ic_off = 0; ic_off < in_c_per_group; ++ic_off) {
       int ic = ic_base + ic_off;
@@ -73,14 +69,13 @@ __mlu_entry__ void grouped_conv2d_half_kernel(
   }
 }
 
-torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel, torch::Tensor bias,
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel,
                         int in_channels, int out_channels,
                         int kernel_size, int groups) {
-  TORCH_CHECK(x.is_contiguous() && kernel.is_contiguous() && bias.is_contiguous(),
+  TORCH_CHECK(x.is_contiguous() && kernel.is_contiguous(),
               "Inputs must be contiguous");
   TORCH_CHECK(x.scalar_type() == torch::kHalf &&
-                  kernel.scalar_type() == torch::kHalf &&
-                  bias.scalar_type() == torch::kHalf,
+                  kernel.scalar_type() == torch::kHalf,
               "Only float16 inputs are supported");
 
   int batch = static_cast<int>(x.size(0));
@@ -100,7 +95,6 @@ torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel, torch::Tensor bia
   grouped_conv2d_half_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
       reinterpret_cast<const half *>(x.data_ptr<c10::Half>()),
       reinterpret_cast<const half *>(kernel.data_ptr<c10::Half>()),
-      reinterpret_cast<const half *>(bias.data_ptr<c10::Half>()),
       output.data_ptr<float>(), total_tiles, in_channels, out_channels, height,
       width, kernel_size, groups, padding, out_h, out_w);
   return output;
