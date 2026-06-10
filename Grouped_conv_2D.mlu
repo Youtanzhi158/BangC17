@@ -5,15 +5,18 @@
 
 #define TASK_NUM 256
 #define TILE_W 128
+// segment buffer must hold aligned_len (<=128) plus halo for kernel width (<=64)
+#define SEG_MAX 192
 
 __mlu_entry__ void grouped_conv2d_half_kernel(
     const half *x, const half *kernel, float *out,
     int total_tiles, int in_channels, int out_channels,
     int height, int width, int kernel_size, int groups,
     int padding, int out_h, int out_w) {
-  __nram__ half nram_x_h[TILE_W];
-  __nram__ float nram_x_f[TILE_W];
-  __nram__ float nram_out[TILE_W];
+  __nram__ half nram_seg_h[SEG_MAX];   // halo row of input (half), zero-padded
+  __nram__ float nram_seg_f[SEG_MAX];  // same row as float
+  __nram__ float nram_shift[TILE_W];   // aligned shifted slice for one kw
+  __nram__ float nram_out[TILE_W];     // accumulator for the output tile
 
   int in_c_per_group = in_channels / groups;
   int out_c_per_group = out_channels / groups;
@@ -34,32 +37,47 @@ __mlu_entry__ void grouped_conv2d_half_kernel(
     if (len > TILE_W) len = TILE_W;
     int aligned_len = (len + 63) & ~63;
 
+    // segment of input columns spanning all kernel-width taps for this tile
+    int seg_start = ow_start - padding;            // input col of first tap
+    int aligned_seg = aligned_len + 64;            // covers halo, <= SEG_MAX
+    if (aligned_seg > SEG_MAX) aligned_seg = SEG_MAX;
+
     __bang_write_value(nram_out, aligned_len, 0.0f);
 
     for (int ic_off = 0; ic_off < in_c_per_group; ++ic_off) {
       int ic = ic_base + ic_off;
       int x_channel_base = ((b * in_channels + ic) * height) * width;
-      int k_channel_base = ((oc * in_c_per_group + ic_off) * kernel_size) * kernel_size;
+      int k_channel_base =
+          ((oc * in_c_per_group + ic_off) * kernel_size) * kernel_size;
 
       for (int kh = 0; kh < kernel_size; ++kh) {
         int ih = oh - padding + kh;
         if (ih < 0 || ih >= height) continue;
         int x_row_base = x_channel_base + ih * width;
 
+        // Load the halo row once: zero the buffer, then bulk-copy the valid
+        // contiguous span of input columns into the right offset.
+        __bang_write_value(nram_seg_h, aligned_seg, (half)0);
+        int valid_lo = seg_start < 0 ? 0 : seg_start;
+        int valid_hi = seg_start + aligned_seg;
+        if (valid_hi > width) valid_hi = width;
+        int copy_count = valid_hi - valid_lo;
+        if (copy_count > 0) {
+          int dst_off = valid_lo - seg_start;  // >= 0
+          __memcpy(nram_seg_h + dst_off, x + x_row_base + valid_lo,
+                   copy_count * sizeof(half), GDRAM2NRAM);
+        }
+        __bang_half2float(nram_seg_f, nram_seg_h, aligned_seg);
+
+        // Reuse the loaded row across all kernel-width positions.
         for (int kw = 0; kw < kernel_size; ++kw) {
           float kv = (float)kernel[k_channel_base + kh * kernel_size + kw];
-          int iw_start = ow_start - padding + kw;
-
-          for (int i = 0; i < aligned_len; ++i) {
-            int iw = iw_start + i;
-            nram_x_h[i] =
-                (i < len && iw >= 0 && iw < width) ? x[x_row_base + iw]
-                                                     : (half)0;
-          }
-
-          __bang_half2float(nram_x_f, nram_x_h, aligned_len);
-          __bang_mul_scalar(nram_x_f, nram_x_f, kv, aligned_len);
-          __bang_add(nram_out, nram_out, nram_x_f, aligned_len);
+          // input col for output i at this kw is seg_start + kw + i,
+          // i.e. slice of the segment starting at index kw.
+          __memcpy(nram_shift, nram_seg_f + kw, aligned_len * sizeof(float),
+                   NRAM2NRAM);
+          __bang_mul_scalar(nram_shift, nram_shift, kv, aligned_len);
+          __bang_add(nram_out, nram_out, nram_shift, aligned_len);
         }
       }
     }
