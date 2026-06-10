@@ -7,13 +7,14 @@
 #define TILE_W 128
 
 __mlu_entry__ void grouped_conv2d_half_kernel(
-    const half *x, const half *kernel, float *out,
+    const half *x, const half *kernel, half *out,
     int total_tiles, int in_channels, int out_channels,
     int height, int width, int kernel_size, int groups,
     int padding, int out_h, int out_w) {
   __nram__ half nram_x_h[TILE_W];
   __nram__ float nram_x_f[TILE_W];
   __nram__ float nram_out[TILE_W];
+  __nram__ half nram_out_h[TILE_W];
 
   int in_c_per_group = in_channels / groups;
   int out_c_per_group = out_channels / groups;
@@ -64,8 +65,9 @@ __mlu_entry__ void grouped_conv2d_half_kernel(
       }
     }
 
+    __bang_float2half_rd(nram_out_h, nram_out, aligned_len);
     __memcpy(out + ((b * out_channels + oc) * out_h + oh) * out_w + ow_start,
-             nram_out, len * sizeof(float), NRAM2GDRAM);
+             nram_out_h, len * sizeof(half), NRAM2GDRAM);
   }
 }
 
@@ -86,7 +88,7 @@ torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel,
   int out_w = width;
 
   auto output = torch::empty({batch, out_channels, out_h, out_w},
-                             x.options().dtype(torch::kFloat));
+                             x.options().dtype(torch::kHalf));
 
   int tiles_w = (out_w + TILE_W - 1) / TILE_W;
   int total_tiles = batch * out_channels * out_h * tiles_w;
@@ -95,7 +97,8 @@ torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel,
   grouped_conv2d_half_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
       reinterpret_cast<const half *>(x.data_ptr<c10::Half>()),
       reinterpret_cast<const half *>(kernel.data_ptr<c10::Half>()),
-      output.data_ptr<float>(), total_tiles, in_channels, out_channels, height,
-      width, kernel_size, groups, padding, out_h, out_w);
+      reinterpret_cast<half *>(output.data_ptr<c10::Half>()),
+      total_tiles, in_channels, out_channels, height, width,
+      kernel_size, groups, padding, out_h, out_w);
   return output;
 }
