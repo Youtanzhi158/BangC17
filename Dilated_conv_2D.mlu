@@ -57,9 +57,9 @@ __mlu_entry__ void dilated_conv2d_half_kernel(
         for (int iw_local = 0; iw_local < in_cols; ++iw_local) {
           int iw = ow_start - padding + iw_local;
           int valid = (ih >= 0 && ih < height && iw >= 0 && iw < width);
+          int dst_base = (ih_local * in_cols + iw_local) * ic_count;
           for (int ic = 0; ic < ic_count; ++ic) {
-            int dst = (ic * in_rows + ih_local) * in_cols + iw_local;
-            nram_in[dst] =
+            nram_in[dst_base + ic] =
                 valid ? (float)x[((b * in_channels + ic_start + ic) * height +
                                   ih) *
                                      width +
@@ -83,11 +83,11 @@ __mlu_entry__ void dilated_conv2d_half_kernel(
                 for (int ic = 0; ic < ic_count; ++ic) {
                   wram_filter[fidx++] =
                       active
-                          ? (float)kernel[((oc * in_channels + ic_start + ic) *
+                          ? (float)kernel[((oc * kernel_size + kh) *
                                                kernel_size +
-                                           kh) *
-                                              kernel_size +
-                                          kw]
+                                           kw) *
+                                              in_channels +
+                                          ic_start + ic]
                           : 0.0f;
                 }
               }
@@ -106,11 +106,11 @@ __mlu_entry__ void dilated_conv2d_half_kernel(
               for (int ic = 0; ic < ic_count; ++ic) {
                 wram_filter[fidx++] =
                     active
-                        ? (float)kernel[((oc * in_channels + ic_start + ic) *
+                        ? (float)kernel[((oc * kernel_size + kh) *
                                              kernel_size +
-                                         kh) *
-                                            kernel_size +
-                                        kw]
+                                         kw) *
+                                            in_channels +
+                                        ic_start + ic]
                         : 0.0f;
               }
             }
@@ -127,10 +127,11 @@ __mlu_entry__ void dilated_conv2d_half_kernel(
       int oh = oh_start + rh;
       for (int cw = 0; cw < cols; ++cw) {
         int ow = ow_start + cw;
+        int src_base = (rh * cols + cw) * oc_count;
         for (int oc_local = 0; oc_local < oc_count; ++oc_local) {
           int oc = oc_start + oc_local;
           out[((b * out_channels + oc) * out_h + oh) * out_w + ow] =
-              nram_acc[(oc_local * rows + rh) * cols + cw];
+              nram_acc[src_base + oc_local];
         }
       }
     }
