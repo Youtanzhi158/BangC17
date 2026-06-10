@@ -57,9 +57,9 @@ __mlu_entry__ void dilated_conv2d_half_kernel(
         for (int iw_local = 0; iw_local < in_cols; ++iw_local) {
           int iw = ow_start - padding + iw_local;
           int valid = (ih >= 0 && ih < height && iw >= 0 && iw < width);
-          int dst_base = (ih_local * in_cols + iw_local) * ic_count;
           for (int ic = 0; ic < ic_count; ++ic) {
-            nram_in[dst_base + ic] =
+            int dst = (ic * in_rows + ih_local) * in_cols + iw_local;
+            nram_in[dst] =
                 valid ? (float)x[((b * in_channels + ic_start + ic) * height +
                                   ih) *
                                      width +
