@@ -1,0 +1,101 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <c10/util/Half.h>
+
+#define TASK_NUM 256
+#define TILE_W 128
+
+__mlu_entry__ void grouped_conv2d_half_kernel(
+    const half *x, const half *kernel, float *out,
+    int total_tiles, int in_channels, int out_channels,
+    int height, int width, int kernel_size, int groups,
+    int padding, int out_h, int out_w) {
+  __nram__ half nram_x_h[TILE_W];
+  __nram__ float nram_x_f[TILE_W];
+  __nram__ float nram_out[TILE_W];
+
+  int in_c_per_group = in_channels / groups;
+  int out_c_per_group = out_channels / groups;
+  int tiles_w = (out_w + TILE_W - 1) / TILE_W;
+
+  for (int tile = taskId; tile < total_tiles; tile += taskDim) {
+    int tw = tile % tiles_w;
+    int tmp = tile / tiles_w;
+    int oh = tmp % out_h;
+    tmp /= out_h;
+    int oc = tmp % out_channels;
+    int b = tmp / out_channels;
+    int g = oc / out_c_per_group;
+    int ic_base = g * in_c_per_group;
+
+    int ow_start = tw * TILE_W;
+    int len = out_w - ow_start;
+    if (len > TILE_W) len = TILE_W;
+    int aligned_len = (len + 63) & ~63;
+
+    __bang_write_value(nram_out, aligned_len, 0.0f);
+
+    for (int ic_off = 0; ic_off < in_c_per_group; ++ic_off) {
+      int ic = ic_base + ic_off;
+      int x_channel_base = ((b * in_channels + ic) * height) * width;
+      int k_channel_base = ((oc * in_c_per_group + ic_off) * kernel_size) * kernel_size;
+
+      for (int kh = 0; kh < kernel_size; ++kh) {
+        int ih = oh - padding + kh;
+        if (ih < 0 || ih >= height) continue;
+        int x_row_base = x_channel_base + ih * width;
+
+        for (int kw = 0; kw < kernel_size; ++kw) {
+          float kv = (float)kernel[k_channel_base + kh * kernel_size + kw];
+          int iw_start = ow_start - padding + kw;
+
+          for (int i = 0; i < aligned_len; ++i) {
+            int iw = iw_start + i;
+            nram_x_h[i] =
+                (i < len && iw >= 0 && iw < width) ? x[x_row_base + iw]
+                                                     : (half)0;
+          }
+
+          __bang_half2float(nram_x_f, nram_x_h, aligned_len);
+          __bang_mul_scalar(nram_x_f, nram_x_f, kv, aligned_len);
+          __bang_add(nram_out, nram_out, nram_x_f, aligned_len);
+        }
+      }
+    }
+
+    __memcpy(out + ((b * out_channels + oc) * out_h + oh) * out_w + ow_start,
+             nram_out, len * sizeof(float), NRAM2GDRAM);
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel,
+                        int in_channels, int out_channels,
+                        int kernel_size, int groups) {
+  TORCH_CHECK(x.is_contiguous() && kernel.is_contiguous(),
+              "Inputs must be contiguous");
+  TORCH_CHECK(x.scalar_type() == torch::kHalf &&
+                  kernel.scalar_type() == torch::kHalf,
+              "Only float16 inputs are supported");
+
+  int batch = static_cast<int>(x.size(0));
+  int height = static_cast<int>(x.size(2));
+  int width = static_cast<int>(x.size(3));
+  int padding = kernel_size / 2;
+  int out_h = height;
+  int out_w = width;
+
+  auto output = torch::empty({batch, out_channels, out_h, out_w},
+                             x.options().dtype(torch::kFloat));
+
+  int tiles_w = (out_w + TILE_W - 1) / TILE_W;
+  int total_tiles = batch * out_channels * out_h * tiles_w;
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t grid = {TASK_NUM, 1, 1};
+  grouped_conv2d_half_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
+      reinterpret_cast<const half *>(x.data_ptr<c10::Half>()),
+      reinterpret_cast<const half *>(kernel.data_ptr<c10::Half>()),
+      output.data_ptr<float>(), total_tiles, in_channels, out_channels, height,
+      width, kernel_size, groups, padding, out_h, out_w);
+  return output;
+}
