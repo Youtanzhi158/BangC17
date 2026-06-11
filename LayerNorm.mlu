@@ -25,12 +25,22 @@ __mlu_entry__ void layer_norm_half_kernel(
     __memcpy(nram_half, row_ptr, cols * sizeof(half), GDRAM2NRAM);
     __bang_half2float(nram_value, nram_half, cols);
 
-    __bang_sum(nram_reduce, nram_value, cols);
+    __bang_sumpool(
+        nram_reduce, nram_value,
+        1, cols,
+        1, cols,
+        1, cols,
+        1);
     float mean = nram_reduce[0] * (1.0f / (float)LAYER_NORM_WIDTH);
 
     __bang_sub_scalar(nram_centered, nram_value, mean, cols);
     __bang_mul(nram_value, nram_centered, nram_centered, cols);
-    __bang_sum(nram_reduce, nram_value, cols);
+    __bang_sumpool(
+        nram_reduce, nram_value,
+        1, cols,
+        1, cols,
+        1, cols,
+        1);
     float variance =
         nram_reduce[0] * (1.0f / (float)LAYER_NORM_WIDTH);
 
