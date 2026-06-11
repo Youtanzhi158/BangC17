@@ -1,0 +1,49 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <c10/util/Half.h>
+
+#define CHUNK_SIZE 4096
+#define TASK_NUM 64
+
+__mlu_entry__ void elementwise_add_half_kernel(const half *a, const half *b,
+                                                half *output, int total) {
+  int core_id = taskId;
+  int per_core = total / taskDim;
+  int remainder = total % taskDim;
+  int start = core_id * per_core + (core_id < remainder ? core_id : remainder);
+  int count = per_core + (core_id < remainder ? 1 : 0);
+
+  __nram__ half nram_a[CHUNK_SIZE];
+  __nram__ half nram_b[CHUNK_SIZE];
+  __nram__ half nram_output[CHUNK_SIZE];
+
+  for (int offset = 0; offset < count; offset += CHUNK_SIZE) {
+    int len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : count - offset;
+    int aligned_len = (len + 63) & ~63;
+    __memcpy(nram_a, a + start + offset, len * sizeof(half), GDRAM2NRAM);
+    __memcpy(nram_b, b + start + offset, len * sizeof(half), GDRAM2NRAM);
+    __bang_add(nram_output, nram_a, nram_b, aligned_len);
+    __memcpy(output + start + offset, nram_output, len * sizeof(half),
+             NRAM2GDRAM);
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor a, torch::Tensor b) {
+  TORCH_CHECK(a.is_contiguous() && b.is_contiguous(),
+              "Inputs must be contiguous");
+  TORCH_CHECK(a.scalar_type() == torch::kHalf &&
+                  b.scalar_type() == torch::kHalf,
+              "Only float16 inputs are supported");
+  TORCH_CHECK(a.sizes() == b.sizes(), "Input shapes must match");
+
+  auto output = torch::empty_like(a);
+  int total = static_cast<int>(a.numel());
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t grid = {TASK_NUM, 1, 1};
+  elementwise_add_half_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
+      reinterpret_cast<const half *>(a.data_ptr<c10::Half>()),
+      reinterpret_cast<const half *>(b.data_ptr<c10::Half>()),
+      reinterpret_cast<half *>(output.data_ptr<c10::Half>()), total);
+  return output;
+}
