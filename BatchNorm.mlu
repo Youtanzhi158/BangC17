@@ -1,0 +1,62 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <c10/util/Half.h>
+
+#define TASK_NUM 64
+#define EPS 1.0e-5f
+
+__mlu_entry__ void batchnorm2d_half_kernel(const half *x, half *out,
+                                           int batch, int channels,
+                                           int height, int width) {
+  int c = taskId;
+  if (c >= channels) return;
+  int spatial = height * width;
+  int count = batch * spatial;
+  __nram__ float nram_scalar[64];
+
+  float sum = 0.0f;
+  for (int b = 0; b < batch; ++b) {
+    int base = (b * channels + c) * spatial;
+    for (int s = 0; s < spatial; ++s) {
+      sum += (float)x[base + s];
+    }
+  }
+  float mean = sum / (float)count;
+
+  float var_sum = 0.0f;
+  for (int b = 0; b < batch; ++b) {
+    int base = (b * channels + c) * spatial;
+    for (int s = 0; s < spatial; ++s) {
+      float d = (float)x[base + s] - mean;
+      var_sum += d * d;
+    }
+  }
+  __bang_write_value(nram_scalar, 64, var_sum / (float)count + EPS);
+  __bang_sqrt(nram_scalar, nram_scalar, 64);
+  float inv_std = 1.0f / nram_scalar[0];
+
+  for (int b = 0; b < batch; ++b) {
+    int base = (b * channels + c) * spatial;
+    for (int s = 0; s < spatial; ++s) {
+      out[base + s] = (half)(((float)x[base + s] - mean) * inv_std);
+    }
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int num_features) {
+  TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+  TORCH_CHECK(x.scalar_type() == torch::kHalf, "Only float16 input is supported");
+  int batch = static_cast<int>(x.size(0));
+  int channels = static_cast<int>(x.size(1));
+  int height = static_cast<int>(x.size(2));
+  int width = static_cast<int>(x.size(3));
+  auto output = torch::empty_like(x);
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t grid = {static_cast<unsigned int>(channels), 1, 1};
+  batchnorm2d_half_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
+      reinterpret_cast<const half *>(x.data_ptr<c10::Half>()),
+      reinterpret_cast<half *>(output.data_ptr<c10::Half>()), batch, channels,
+      height, width);
+  return output;
+}

@@ -1,0 +1,114 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define TILE_N 256
+
+__mlu_entry__ void batched_matmul_kernel(
+    const float *a,
+    const float *b,
+    float *out,
+    int batch,
+    int m,
+    int k,
+    int n) {
+    int task_id = taskId;
+    int task_num = taskDim;
+    int total_rows = batch * m;
+
+    __nram__ float nram_b[TILE_N];
+    __nram__ float nram_tmp[TILE_N];
+    __nram__ float nram_acc[TILE_N];
+
+    for (int row_id = task_id; row_id < total_rows; row_id += task_num) {
+        int batch_idx = row_id / m;
+        int row = row_id % m;
+        int a_base = batch_idx * m * k + row * k;
+        int out_base = batch_idx * m * n + row * n;
+
+        for (int col = 0; col < n; col += TILE_N) {
+            int len = (col + TILE_N <= n) ? TILE_N : (n - col);
+            int aligned_len = (len + 63) & ~63;
+
+            for (int i = 0; i < aligned_len; ++i) {
+                nram_acc[i] = 0.0f;
+            }
+
+            for (int kk = 0; kk < k; ++kk) {
+                int b_base = batch_idx * k * n + kk * n + col;
+                float a_value = a[a_base + kk];
+
+                __memcpy(
+                    nram_b,
+                    b + b_base,
+                    len * sizeof(float),
+                    GDRAM2NRAM);
+
+                __bang_mul_scalar(
+                    nram_tmp,
+                    nram_b,
+                    a_value,
+                    aligned_len);
+
+                __bang_add(
+                    nram_acc,
+                    nram_acc,
+                    nram_tmp,
+                    aligned_len);
+            }
+
+            __memcpy(
+                out + out_base + col,
+                nram_acc,
+                len * sizeof(float),
+                NRAM2GDRAM);
+        }
+    }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor a,
+    torch::Tensor b) {
+
+    TORCH_CHECK(a.is_contiguous(), "A must be contiguous");
+    TORCH_CHECK(b.is_contiguous(), "B must be contiguous");
+    TORCH_CHECK(a.dim() == 3, "A must have shape [batch, m, k]");
+    TORCH_CHECK(b.dim() == 3, "B must have shape [batch, k, n]");
+    TORCH_CHECK(a.size(0) == b.size(0), "batch size mismatch");
+    TORCH_CHECK(a.size(2) == b.size(1), "inner dimension mismatch");
+
+    int batch = (int)a.size(0);
+    int m = (int)a.size(1);
+    int k = (int)a.size(2);
+    int n = (int)b.size(2);
+
+    auto original_dtype = a.scalar_type();
+    TORCH_CHECK(
+        original_dtype == torch::kFloat16,
+        "A must be float16");
+    TORCH_CHECK(
+        b.scalar_type() == torch::kFloat16,
+        "B must be float16");
+
+    torch::Tensor a_fp32 = a.to(torch::kFloat);
+    torch::Tensor b_fp32 = b.to(torch::kFloat);
+
+    auto output = torch::empty(
+        {batch, m, n},
+        a_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {16, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    batched_matmul_kernel<<<dim, ktype, queue>>>(
+        a_fp32.data_ptr<float>(),
+        b_fp32.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch,
+        m,
+        k,
+        n);
+
+    return output;
+}

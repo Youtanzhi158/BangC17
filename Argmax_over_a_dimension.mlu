@@ -1,0 +1,47 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <c10/util/Half.h>
+#include <cstdint>
+
+#define MAX_DIM1 256
+#define MAX_DIM2 256
+
+__mlu_entry__ void argmax_dim1_half_kernel(const half *x, int64_t *out,
+                                           int batch, int dim1, int dim2) {
+  int b = taskId;
+  if (b >= batch) return;
+
+  __nram__ half nram_x[MAX_DIM1 * MAX_DIM2];
+  __memcpy(nram_x, x + b * dim1 * dim2, dim1 * dim2 * sizeof(half),
+           GDRAM2NRAM);
+
+  for (int j = 0; j < dim2; ++j) {
+    int best = 0;
+    float best_val = (float)nram_x[j];
+    for (int i = 1; i < dim1; ++i) {
+      float v = (float)nram_x[i * dim2 + j];
+      if (v > best_val) {
+        best_val = v;
+        best = i;
+      }
+    }
+    out[b * dim2 + j] = (int64_t)best;
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+  TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+  TORCH_CHECK(x.scalar_type() == torch::kHalf, "Only float16 input is supported");
+  TORCH_CHECK(dim == 1, "Only dim=1 is supported");
+  int batch = static_cast<int>(x.size(0));
+  int dim1 = static_cast<int>(x.size(1));
+  int dim2 = static_cast<int>(x.size(2));
+  auto output = torch::empty({batch, dim2}, x.options().dtype(torch::kInt64));
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t grid = {static_cast<unsigned int>(batch), 1, 1};
+  argmax_dim1_half_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
+      reinterpret_cast<const half *>(x.data_ptr<c10::Half>()),
+      output.data_ptr<int64_t>(), batch, dim1, dim2);
+  return output;
+}

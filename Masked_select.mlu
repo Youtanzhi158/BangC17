@@ -1,0 +1,50 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <c10/util/Half.h>
+#include <cstdint>
+
+__mlu_entry__ void masked_count_half_kernel(const half *input, int32_t *count,
+                                            int total, float threshold) {
+  if (taskId != 0) return;
+  int c = 0;
+  for (int i = 0; i < total; ++i) {
+    if ((float)input[i] > threshold) ++c;
+  }
+  count[0] = c;
+}
+
+__mlu_entry__ void masked_select_half_kernel(const half *input, half *output,
+                                             int total, float threshold) {
+  if (taskId != 0) return;
+  int pos = 0;
+  for (int i = 0; i < total; ++i) {
+    float v = (float)input[i];
+    if (v > threshold) {
+      output[pos++] = (half)v;
+    }
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor input, double threshold) {
+  TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+  TORCH_CHECK(input.scalar_type() == torch::kHalf, "Only float16 input is supported");
+  int total = static_cast<int>(input.numel());
+  auto count_dev = torch::empty({1}, input.options().dtype(torch::kInt32));
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t one = {1, 1, 1};
+  masked_count_half_kernel<<<one, cnrtFuncTypeBlock, queue>>>(
+      reinterpret_cast<const half *>(input.data_ptr<c10::Half>()),
+      count_dev.data_ptr<int32_t>(), total, static_cast<float>(threshold));
+  cnrtQueueSync(queue);
+
+  int32_t count_host = 0;
+  cnrtMemcpy(&count_host, count_dev.data_ptr<int32_t>(), sizeof(int32_t),
+             cnrtMemcpyDevToHost);
+  auto output = torch::empty({count_host}, input.options());
+  masked_select_half_kernel<<<one, cnrtFuncTypeBlock, queue>>>(
+      reinterpret_cast<const half *>(input.data_ptr<c10::Half>()),
+      reinterpret_cast<half *>(output.data_ptr<c10::Half>()), total,
+      static_cast<float>(threshold));
+  return output;
+}
