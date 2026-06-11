@@ -1,0 +1,88 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <c10/util/Half.h>
+#include <vector>
+
+#define INPUT_HEIGHT 256
+#define INPUT_WIDTH 256
+#define OUTPUT_HEIGHT 8
+#define OUTPUT_WIDTH 8
+#define POOL_KERNEL 32
+#define CHANNELS_PER_TILE 2
+#define POOL_TASKS 16
+
+__mlu_entry__ void adaptive_max_pool_2d_half_kernel(
+    const half *input,
+    half *output,
+    int total_planes) {
+  if (__is_mpu()) {
+    return;
+  }
+
+  const int input_plane = INPUT_HEIGHT * INPUT_WIDTH;
+  const int output_plane = OUTPUT_HEIGHT * OUTPUT_WIDTH;
+  const int total_tiles =
+      (total_planes + CHANNELS_PER_TILE - 1) / CHANNELS_PER_TILE;
+
+  __nram__ half nram_input[CHANNELS_PER_TILE * INPUT_HEIGHT * INPUT_WIDTH];
+  __nram__ half nram_output[CHANNELS_PER_TILE * OUTPUT_HEIGHT * OUTPUT_WIDTH];
+
+  for (int tile = taskId; tile < total_tiles; tile += taskDim) {
+    int plane_begin = tile * CHANNELS_PER_TILE;
+    int tile_planes = total_planes - plane_begin;
+    if (tile_planes > CHANNELS_PER_TILE) {
+      tile_planes = CHANNELS_PER_TILE;
+    }
+
+    __memcpy(
+        nram_input,
+        input + plane_begin * input_plane,
+        tile_planes * input_plane * sizeof(half),
+        GDRAM2NRAM);
+
+    __bang_maxpool(
+        nram_output,
+        nram_input,
+        tile_planes,
+        INPUT_HEIGHT,
+        INPUT_WIDTH,
+        POOL_KERNEL,
+        POOL_KERNEL);
+
+    __memcpy(
+        output + plane_begin * output_plane,
+        nram_output,
+        tile_planes * output_plane * sizeof(half),
+        NRAM2GDRAM);
+  }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    std::vector<int64_t> output_size) {
+  TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+  TORCH_CHECK(x.scalar_type() == torch::kHalf,
+              "Only float16 input is supported");
+  TORCH_CHECK(x.dim() == 4, "Input must have shape [N, C, H, W]");
+  TORCH_CHECK(x.size(2) == INPUT_HEIGHT && x.size(3) == INPUT_WIDTH,
+              "Only 256x256 input is supported");
+  TORCH_CHECK(output_size.size() == 2 &&
+                  output_size[0] == OUTPUT_HEIGHT &&
+                  output_size[1] == OUTPUT_WIDTH,
+              "Only output_size=(8, 8) is supported");
+
+  int batch = static_cast<int>(x.size(0));
+  int channels = static_cast<int>(x.size(1));
+  auto output = torch::empty(
+      {batch, channels, OUTPUT_HEIGHT, OUTPUT_WIDTH},
+      x.options());
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t grid = {POOL_TASKS, 1, 1};
+  adaptive_max_pool_2d_half_kernel<<<grid, cnrtFuncTypeUnion1, queue>>>(
+      reinterpret_cast<const half *>(x.data_ptr<c10::Half>()),
+      reinterpret_cast<half *>(output.data_ptr<c10::Half>()),
+      batch * channels);
+  return output;
+}
