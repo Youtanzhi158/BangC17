@@ -39,12 +39,11 @@ torch::Tensor bang_func(torch::Tensor x) {
   TORCH_CHECK(x.scalar_type() == torch::kHalf,
               "Only float16 input is supported");
 
-  auto output = torch::empty_like(x);
   int total = static_cast<int>(x.numel());
   cnrtQueue_t queue = torch_mlu::getCurMLUStream();
   cnrtDim3_t grid = {TASK_NUM, 1, 1};
   hard_tanh_half_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
       reinterpret_cast<const half *>(x.data_ptr<c10::Half>()),
-      reinterpret_cast<half *>(output.data_ptr<c10::Half>()), total);
-  return output;
+      reinterpret_cast<half *>(x.data_ptr<c10::Half>()), total);
+  return x;
 }

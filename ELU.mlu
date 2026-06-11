@@ -1,0 +1,47 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <c10/util/Half.h>
+
+#define TILE 16384
+#define TASKS 16
+
+__mlu_entry__ void elu_half_kernel(half *x, int total, half alpha) {
+  int per_core = total / taskDim;
+  int rem = total % taskDim;
+  int start = taskId * per_core + (taskId < rem ? taskId : rem);
+  int count = per_core + (taskId < rem ? 1 : 0);
+
+  __nram__ half input[TILE];
+  __nram__ half value[TILE];
+  __nram__ half mask[TILE];
+  __nram__ half work[TILE * 2];
+
+  for (int offset = 0; offset < count; offset += TILE) {
+    int len = count - offset;
+    if (len > TILE) len = TILE;
+    int aligned = (len + 63) & ~63;
+    __memcpy(input, x + start + offset, len * sizeof(half), GDRAM2NRAM);
+
+    __mluop_exp(value, input, work, 1, aligned);
+    __bang_add_scalar(value, value, (half)-1.0f, aligned);
+    __bang_mul_scalar(value, value, alpha, aligned);
+    __bang_ge_scalar(mask, input, (half)0.0f, aligned);
+    __bang_sub(input, input, value, aligned);
+    __bang_mul(input, input, mask, aligned);
+    __bang_add(value, value, input, aligned);
+
+    __memcpy(x + start + offset, value, len * sizeof(half), NRAM2GDRAM);
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor x, float alpha) {
+  TORCH_CHECK(x.is_contiguous() && x.scalar_type() == torch::kHalf,
+              "ELU expects contiguous float16 input");
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t grid = {TASKS, 1, 1};
+  elu_half_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
+      reinterpret_cast<half *>(x.data_ptr<c10::Half>()),
+      static_cast<int>(x.numel()), (half)alpha);
+  return x;
+}
