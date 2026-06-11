@@ -9,7 +9,7 @@
 #define OUTPUT_HEIGHT 8
 #define OUTPUT_WIDTH 8
 #define POOL_KERNEL 32
-#define CHANNELS_PER_TILE 2
+#define CHANNELS_PER_TILE 1
 #define POOL_TASKS 16
 
 __mlu_entry__ void adaptive_max_pool_2d_half_kernel(
