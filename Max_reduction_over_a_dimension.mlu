@@ -12,17 +12,13 @@ __mlu_entry__ void max_dim1_half_kernel(const half *input, half *output,
   if (batch_index >= batch) return;
 
   __nram__ half nram_input[MAX_DIM1 * MAX_DIM2];
+  __nram__ half nram_output[MAX_DIM2];
   __memcpy(nram_input, input + batch_index * dim1 * dim2,
            dim1 * dim2 * sizeof(half), GDRAM2NRAM);
 
-  for (int column = 0; column < dim2; ++column) {
-    half best = nram_input[column];
-    for (int row = 1; row < dim1; ++row) {
-      half value = nram_input[row * dim2 + column];
-      if ((float)value > (float)best) best = value;
-    }
-    output[batch_index * dim2 + column] = best;
-  }
+  __bang_maxpool(nram_output, nram_input, 1, dim1, dim2, dim1, 1);
+  __memcpy(output + batch_index * dim2, nram_output,
+           dim2 * sizeof(half), NRAM2GDRAM);
 }
 
 torch::Tensor bang_func(torch::Tensor x, int dim) {
