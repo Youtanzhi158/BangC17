@@ -5,6 +5,7 @@
 
 #define LAYER_NORM_WIDTH 512
 #define LAYER_NORM_TASKS 16
+#define LAYER_NORM_TILE_ROWS 64
 #define LAYER_NORM_EPS 1.0e-5f
 
 __mlu_entry__ void layer_norm_half_kernel(
@@ -15,42 +16,67 @@ __mlu_entry__ void layer_norm_half_kernel(
     return;
   }
 
-  __nram__ half nram_half[LAYER_NORM_WIDTH];
-  __nram__ float nram_value[LAYER_NORM_WIDTH];
+  __nram__ half nram_half[LAYER_NORM_TILE_ROWS * LAYER_NORM_WIDTH];
+  __nram__ float nram_value[LAYER_NORM_TILE_ROWS * LAYER_NORM_WIDTH];
   __nram__ float nram_centered[LAYER_NORM_WIDTH];
   __nram__ float nram_reduce[64];
 
-  for (int row = taskId; row < rows; row += taskDim) {
-    half *row_ptr = x + row * cols;
-    __memcpy(nram_half, row_ptr, cols * sizeof(half), GDRAM2NRAM);
-    __bang_half2float(nram_value, nram_half, cols);
+  int rows_per_task = (rows + taskDim - 1) / taskDim;
+  int row_begin = taskId * rows_per_task;
+  int row_end = row_begin + rows_per_task;
+  if (row_end > rows) {
+    row_end = rows;
+  }
 
-    __bang_sumpool(
-        nram_reduce, nram_value,
-        1, cols,
-        1, cols,
-        1, cols,
-        1);
-    float mean = nram_reduce[0] * (1.0f / (float)LAYER_NORM_WIDTH);
+  for (int tile_begin = row_begin;
+       tile_begin < row_end;
+       tile_begin += LAYER_NORM_TILE_ROWS) {
+    int tile_rows = row_end - tile_begin;
+    if (tile_rows > LAYER_NORM_TILE_ROWS) {
+      tile_rows = LAYER_NORM_TILE_ROWS;
+    }
+    int tile_elements = tile_rows * cols;
+    half *tile_ptr = x + tile_begin * cols;
 
-    __bang_sub_scalar(nram_centered, nram_value, mean, cols);
-    __bang_mul(nram_value, nram_centered, nram_centered, cols);
-    __bang_sumpool(
-        nram_reduce, nram_value,
-        1, cols,
-        1, cols,
-        1, cols,
-        1);
-    float variance =
-        nram_reduce[0] * (1.0f / (float)LAYER_NORM_WIDTH);
+    __memcpy(
+        nram_half, tile_ptr,
+        tile_elements * sizeof(half),
+        GDRAM2NRAM);
+    __bang_half2float(nram_value, nram_half, tile_elements);
 
-    __bang_write_value(nram_reduce, 64, variance + LAYER_NORM_EPS);
-    __bang_sqrt(nram_reduce, nram_reduce, 64);
-    float inv_std = 1.0f / nram_reduce[0];
+    for (int local_row = 0; local_row < tile_rows; ++local_row) {
+      float *row_value = nram_value + local_row * cols;
+      __bang_sumpool(
+          nram_reduce, row_value,
+          1, cols,
+          1, cols,
+          1, cols,
+          1);
+      float mean =
+          nram_reduce[0] * (1.0f / (float)LAYER_NORM_WIDTH);
 
-    __bang_mul_scalar(nram_centered, nram_centered, inv_std, cols);
-    __bang_float2half_rn(nram_half, nram_centered, cols);
-    __memcpy(row_ptr, nram_half, cols * sizeof(half), NRAM2GDRAM);
+      __bang_sub_scalar(nram_centered, row_value, mean, cols);
+      __bang_mul(row_value, nram_centered, nram_centered, cols);
+      __bang_sumpool(
+          nram_reduce, row_value,
+          1, cols,
+          1, cols,
+          1, cols,
+          1);
+      float variance =
+          nram_reduce[0] * (1.0f / (float)LAYER_NORM_WIDTH);
+
+      __bang_write_value(nram_reduce, 64, variance + LAYER_NORM_EPS);
+      __bang_sqrt(nram_reduce, nram_reduce, 64);
+      float inv_std = 1.0f / nram_reduce[0];
+      __bang_mul_scalar(row_value, nram_centered, inv_std, cols);
+    }
+
+    __bang_float2half_rn(nram_half, nram_value, tile_elements);
+    __memcpy(
+        tile_ptr, nram_half,
+        tile_elements * sizeof(half),
+        NRAM2GDRAM);
   }
 }
 
