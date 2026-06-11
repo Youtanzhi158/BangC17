@@ -9,7 +9,6 @@
 #define OUTPUT_HEIGHT 8
 #define OUTPUT_WIDTH 8
 #define POOL_KERNEL 32
-#define CHANNELS_PER_TILE 1
 #define POOL_TASKS 64
 
 __mlu_entry__ void adaptive_max_pool_2d_half_kernel(
@@ -22,40 +21,54 @@ __mlu_entry__ void adaptive_max_pool_2d_half_kernel(
 
   const int input_plane = INPUT_HEIGHT * INPUT_WIDTH;
   const int output_plane = OUTPUT_HEIGHT * OUTPUT_WIDTH;
-  const int total_tiles =
-      (total_planes + CHANNELS_PER_TILE - 1) / CHANNELS_PER_TILE;
 
-  __nram__ half nram_input[CHANNELS_PER_TILE * INPUT_HEIGHT * INPUT_WIDTH];
-  __nram__ half nram_output[CHANNELS_PER_TILE * OUTPUT_HEIGHT * OUTPUT_WIDTH];
+  __nram__ half nram_input[2 * INPUT_HEIGHT * INPUT_WIDTH];
+  __nram__ half nram_output[2 * OUTPUT_HEIGHT * OUTPUT_WIDTH];
 
-  for (int tile = taskId; tile < total_tiles; tile += taskDim) {
-    int plane_begin = tile * CHANNELS_PER_TILE;
-    int tile_planes = total_planes - plane_begin;
-    if (tile_planes > CHANNELS_PER_TILE) {
-      tile_planes = CHANNELS_PER_TILE;
+  int plane_count = 0;
+  if (taskId < total_planes) {
+    plane_count = (total_planes - 1 - taskId) / taskDim + 1;
+  }
+  if (plane_count == 0) {
+    return;
+  }
+
+  __memcpy_async(
+      nram_input,
+      input + taskId * input_plane,
+      input_plane * sizeof(half),
+      GDRAM2NRAM);
+  __asm__ volatile("sync;");
+
+  for (int index = 0; index < plane_count; ++index) {
+    int current = index & 1;
+    int plane = taskId + index * taskDim;
+    int next_plane = plane + taskDim;
+
+    if (index + 1 < plane_count) {
+      __memcpy_async(
+          nram_input + (1 - current) * input_plane,
+          input + next_plane * input_plane,
+          input_plane * sizeof(half),
+          GDRAM2NRAM);
     }
-
-    __memcpy(
-        nram_input,
-        input + plane_begin * input_plane,
-        tile_planes * input_plane * sizeof(half),
-        GDRAM2NRAM);
-
     __bang_maxpool(
-        nram_output,
-        nram_input,
-        tile_planes,
+        nram_output + current * output_plane,
+        nram_input + current * input_plane,
+        1,
         INPUT_HEIGHT,
         INPUT_WIDTH,
         POOL_KERNEL,
         POOL_KERNEL);
+    __asm__ volatile("sync;");
 
-    __memcpy(
-        output + plane_begin * output_plane,
-        nram_output,
-        tile_planes * output_plane * sizeof(half),
+    __memcpy_async(
+        output + plane * output_plane,
+        nram_output + current * output_plane,
+        output_plane * sizeof(half),
         NRAM2GDRAM);
   }
+  __asm__ volatile("sync;");
 }
 
 torch::Tensor bang_func(
