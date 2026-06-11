@@ -10,7 +10,7 @@
 #define OUTPUT_WIDTH 8
 #define POOL_KERNEL 32
 #define CHANNELS_PER_TILE 1
-#define POOL_TASKS 16
+#define POOL_TASKS 64
 
 __mlu_entry__ void adaptive_max_pool_2d_half_kernel(
     const half *input,
@@ -80,7 +80,7 @@ torch::Tensor bang_func(
 
   cnrtQueue_t queue = torch_mlu::getCurMLUStream();
   cnrtDim3_t grid = {POOL_TASKS, 1, 1};
-  adaptive_max_pool_2d_half_kernel<<<grid, cnrtFuncTypeUnion1, queue>>>(
+  adaptive_max_pool_2d_half_kernel<<<grid, cnrtFuncTypeBlock, queue>>>(
       reinterpret_cast<const half *>(x.data_ptr<c10::Half>()),
       reinterpret_cast<half *>(output.data_ptr<c10::Half>()),
       batch * channels);
